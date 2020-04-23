@@ -12,7 +12,7 @@ import numpy as np
 import time
 import matplotlib.pyplot as plt
 from scipy.io import wavfile
-from scipy.signal import sosfilt, cheby1
+from scipy.signal import sosfilt, cheby1, correlate
 
 def butter_bandpass(lowcut, highcut, fs, order=5):
     nyq = 0.5 * fs
@@ -93,6 +93,7 @@ class Vocoder():
         self.data = self.ad.frames
         self.rate = self.ad.rate
         self.filter_bank()
+        self.pitch_detector_autocorr()
         
     def plot_filtered(self):
         fig, axs = plt.subplots(11, 1, sharex=True)
@@ -101,6 +102,13 @@ class Vocoder():
         for i, signal in enumerate(self.filtered):
             axs[i + 1].plot(t, signal)
         axs[i + 1].set_xlabel('Time [s]')
+    
+    def plot_filtered_sampled(self):
+        fig, axs = plt.subplots(11, 1, sharex=True)
+        t = np.arange(0, self.sampled_weights.shape[1] * 20e-3, 20e-3)
+        for i, signal in enumerate(self.sampled_weights):
+            axs[i].plot(t, signal)
+        axs[i].set_xlabel('Time [s]')
             
     def filter_bank(self):
         values = np.zeros((10, len(self.data)))
@@ -129,14 +137,62 @@ class Vocoder():
             # Apply 25 Hz lowpass filter
             filtered = sosfilt(sos_lp, filtered)
             values[i, :] = filtered
-        self.filtered = values
-                
+        self.weights = values
+    
+    def pitch_detector_autocorr(self):
+        win_size = 400
+        self.pitch_rate = self.rate / win_size
+        print(f"Pitch detection frequency: {self.pitch_rate} Hz")
+        freqs = []
+        
+        # First of all filter signal to interested band
+        sos_bp = cheby1(10, 1, [150, 2950], 'bandpass', fs=self.rate, output='sos')
+        data_mod = sosfilt(sos_bp, self.data)
+        
+        for i in range(0, len(data_mod) - win_size, win_size):
+            # Calculate autocorrelation and throw away the negative lags
+            sig = data_mod[i:i+win_size]
+            corr = correlate(sig, sig, mode='full')
+            corr = corr[len(corr)//2:]
+            
+            # Find the first low point
+            d = np.diff(corr)
+            start = np.nonzero(d > 0)[0][0]
+            # Find the next peak after the low point (other than 0 lag).  This bit is
+            # not reliable for long signals, due to the desired peak occurring between
+            # samples, and other peaks appearing higher.
+            # Should use a weighting function to de-emphasize the peaks at longer lags.
+            peak = np.argmax(corr[start:]) + start
+            px = corr[peak]
+
+            freqs.append(self.rate / px)
+        
+        # Apply 25 Hz LP filter
+        sos_lp = cheby1(10, 1, 25, 'lp', fs=self.pitch_rate, output='sos')
+        freqs_lp = sosfilt(sos_lp, np.array(freqs))
+        self.pitches = freqs_lp
+    
+    def sample(self):
+        rate_s = 20e-3  # One sample every 20ms
+        
+        # First sample the weights
+        self.sampled_weights = self.weights[:, 0::int(self.rate * rate_s)]
+        
+        # Then sample the frequencies
+        self.sampled_pitches = self.pitches[0::int(self.pitch_rate * rate_s)]
+        #self.sampled_pitches = self.sampled_pitches[]
+        
+        print(len(self.sampled_pitches))
+    def synthesize(self):
+        pass
+        
 if __name__ == '__main__':
     rec_time = 5
     a = AudioDevice()
     a.load_wav()
     v = Vocoder(a)
-    v.plot_filtered()
+    v.sample()
+    v.plot_filtered_sampled()
     #a.record(rec_time)
     #a.show_timeplot()
     #time.sleep(rec_time)
