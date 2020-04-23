@@ -106,7 +106,7 @@ class Vocoder():
         self.data = self.ad.frames
         self.rate = self.ad.rate
         
-        self.filter_edges = [10, 250, 550, 850, 1150, 1450,
+        self.filter_edges = [50, 250, 550, 850, 1150, 1450,
                              1750, 2050, 2250, 2650, 2950]
         self.weights = self.filter_bank(self.data, order=order, ripple=ripple)
         self.pitch_detector_fft(order=order, ripple=ripple)
@@ -170,7 +170,7 @@ class Vocoder():
     def pitch_detector_fft(self, lp=False, order=5,ripple=1):
         unvoiced_thresh = 1e-5
         # First of all filter signal to interested band
-        sos_bp = cheby2(order, ripple, [10, 2950], 'bandpass', fs=self.rate, output='sos')
+        sos_bp = cheby2(order, ripple, [150, 2950], 'bandpass', fs=self.rate, output='sos')
         data_mod = sosfilt(sos_bp, self.data)
         
         f, t, Sxx = spectrogram(data_mod, fs=self.rate,
@@ -245,13 +245,17 @@ class Vocoder():
         quant = bins[quant]
         return quant
     
-    def get_quantized(self):
-        w_values = np.array([0.04, 0.158, 0.251, 0.398, 0.63, 1])  # 6 levels txori-logarithmic for weights
+    def get_quantized(self, sampled=True):
+        #w_values = np.array([0.04, 0.158, 0.251, 0.398, 0.63, 1])  # 6 levels txori-logarithmic for weights
+        w_values = np.logspace(-2, 0, 6)
         freq_values = np.linspace(0, 2950, 36)  # 36 levels lineal for pitches
         
-        self.f_quant = self.__quantize(self.sampled_pitches, freq_values)
-        self.w_quant = self.__quantize(self.sampled_weights, w_values)
-        
+        if sampled:
+            self.f_quant = self.__quantize(self.sampled_pitches, freq_values)
+            self.w_quant = self.__quantize(self.sampled_weights, w_values)
+        else:
+            self.f_quant = self.__quantize(self.pitches, freq_values)
+            self.w_quant = self.__quantize(self.weights, w_values)
     def synthesize(self, use_quant=True, final_bp=True,order=5, ripple=1):
         synth_fs = 44100
         n_harms = 10
@@ -303,20 +307,20 @@ class Vocoder():
         self.ad.frames = signal
         
 if __name__ == '__main__':
-    rec_time = 5
-    order=25
-    ripple=20
+    rec_time = 10
+    order=30
+    ripple=30
     a = AudioDevice()
-    a.load_wav("audio.wav")
+    #a.load_wav("english.wav")
     #a.play()
     print(f"Record for {rec_time} seconds...")
-    #a.record(rec_time)
-    #a.save_wav("english.wav")
+    a.record(rec_time)
+    a.save_wav("english.wav")
     v = Vocoder(a,order=order, ripple=ripple)
-    v.plot_filtered()
+    #v.plot_filtered()
     v.sample()
     v.get_quantized()
-    v.synthesize(use_quant=True, order=order, ripple=ripple)
+    v.synthesize(use_quant=True, final_bp=True, order=order, ripple=ripple)
     v.ad.play()
     #v.plot_filtered_sampled()
     #a.record(rec_time)
