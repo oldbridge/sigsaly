@@ -110,17 +110,8 @@ class Vocoder():
         self.data = self.ad.frames
         self.rate = self.ad.rate
         
-        self.filter_channels = [[150, 350],
-                       [350, 550],
-                       [550, 750],
-                       [750, 1050],
-                       [1050, 1450],
-                       [1450, 1750],
-                       [1750, 2000],
-                       [2000, 2350],
-                       [2350, 2650],
-                       [2650, 2950]]
-        
+        self.filter_edges = [10, 250, 550, 850, 1150, 1450,
+                             1750, 2050, 2250, 2650, 2950]
         self.weights = self.filter_bank(self.data)
         self.pitch_detector_autocorr()
         
@@ -139,22 +130,22 @@ class Vocoder():
             axs[i].plot(t, signal)
         axs[i].set_xlabel('Time [s]')
             
-    def filter_bank(self, data, lp=True, rectify=True, order=20):
+    def filter_bank(self, data, lp=True, rectify=True, order=20, ripple=3):
         # Calculate normalization factor
         if rectify:
-            norm_factor = 0.5 / len(self.filter_channels)
+            norm_factor = 0.5 / (len(self.filter_edges) - 1)
         else:
-            norm_factor = 1 / len(self.filter_channels)
-        values = np.zeros((len(self.filter_channels), len(data)))
+            norm_factor = 1 /  (len(self.filter_edges) - 1)
+        values = np.zeros(((len(self.filter_edges) - 1), len(data)))
         
         # Low pass filter of 25 Hz
-        sos_lp = cheby1(order, 1, 25, 'lp', fs=self.rate, output='sos')
-        for i, band in enumerate(self.filter_channels):
-            print(f"Filtering from {band[0]} to {band[1]}")
+        sos_lp = cheby1(order, ripple, 25, 'lp', fs=self.rate, output='sos')
+        for i, band in enumerate(self.filter_edges[:-2]):
+            print(f"Filtering from {band} to {self.filter_edges[i +1]}")
             
             # First apply bandpass
-            sos_bp = cheby1(order, 1, 
-                            band, 
+            sos_bp = cheby1(order, ripple, 
+                            [band, self.filter_edges[i +1]], 
                             'bandpass', 
                             fs=self.rate, 
                             output='sos')
@@ -173,13 +164,13 @@ class Vocoder():
             values[i, :] = filtered
         return values
     
-    def pitch_detector_autocorr(self, lp=False):
+    def pitch_detector_autocorr(self, lp=False, order=20):
         win_size = 500
         unvoiced_thresh = 1
         freqs = np.array([])
         
         # First of all filter signal to interested band
-        sos_bp = cheby1(10, 1, [150, 2950], 'bandpass', fs=self.rate, output='sos')
+        sos_bp = cheby1(order, 3, [10, 2950], 'bandpass', fs=self.rate, output='sos')
         data_mod = sosfilt(sos_bp, self.data)
         
         for i in range(0, len(data_mod) - win_size, win_size):
@@ -207,7 +198,7 @@ class Vocoder():
         
         # Apply 25 Hz LP filter
         if lp:
-            sos_lp = cheby1(20, 1, 25, 'lp', fs=self.rate, output='sos')
+            sos_lp = cheby1(order, 3, 25, 'lp', fs=self.rate, output='sos')
             freqs = sosfilt(sos_lp, freqs)
         
         self.pitches = freqs
@@ -231,8 +222,8 @@ class Vocoder():
         return quant
     
     def get_quantized(self):
-        w_values = np.array([0.0, 0.05, 0.1, 0.4, 0.8, 1])  # 6 levels txori-logarithmic for weights
-        freq_values = np.linspace(150, 2950, 36)  # 36 levels lineal for pitches
+        w_values = np.array([0.04, 0.158, 0.251, 0.398, 0.63, 1])  # 6 levels txori-logarithmic for weights
+        freq_values = np.linspace(0, 2950, 36)  # 36 levels lineal for pitches
         
         self.f_quant = self.__quantize(self.sampled_pitches, freq_values)
         self.w_quant = self.__quantize(self.sampled_weights, w_values)
@@ -241,7 +232,7 @@ class Vocoder():
         synth_fs = 44100
         n_harms = 8
         sample_duration = 20e-3
-        t = np.arange(0, 20e-3, 1 / synth_fs)
+        t = np.arange(0, sample_duration, 1 / synth_fs)
         signal = []
         
         if use_quant:
@@ -270,6 +261,7 @@ class Vocoder():
         # Apply weights
         filtered_sines = self.filter_bank(signal, lp=False, rectify=False)
         signal = np.zeros(filtered_sines.shape[1])
+        
         for c in range(weights.shape[0]):
             weighted = np.repeat(weights[c, :], 
                                 int(filtered_sines.shape[1] / weights.shape[1]))
@@ -280,11 +272,14 @@ class Vocoder():
 if __name__ == '__main__':
     rec_time = 5
     a = AudioDevice()
-    a.load_wav()
+    a.load_wav("audio.wav")
+    print(f"Record for {rec_time} seconds...")
+    #a.record(rec_time)
+    #a.save_wav()
     v = Vocoder(a)
     v.sample()
     v.get_quantized()
-    v.synthesize()
+    v.synthesize(use_quant=False)
     v.ad.play()
     #v.plot_filtered_sampled()
     #a.record(rec_time)
