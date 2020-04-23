@@ -12,7 +12,7 @@ import numpy as np
 import time
 import matplotlib.pyplot as plt
 from scipy.io import wavfile
-from scipy.signal import sosfilt, cheby1, correlate
+from scipy.signal import sosfilt, cheby1, cheby2, correlate, spectrogram
 
 def parabolic(f, x):
     """Quadratic interpolation for estimating the true position of an
@@ -101,15 +101,16 @@ class AudioDevice():
         self.frames = data / 32768
     
 class Vocoder():
-    def __init__(self, audio_device):
+    def __init__(self, audio_device,order=20, ripple=33):
         self.ad = audio_device
         self.data = self.ad.frames
         self.rate = self.ad.rate
         
         self.filter_edges = [10, 250, 550, 850, 1150, 1450,
                              1750, 2050, 2250, 2650, 2950]
-        self.weights = self.filter_bank(self.data)
-        self.pitch_detector_autocorr()
+        self.weights = self.filter_bank(self.data, order=order, ripple=ripple)
+        self.pitch_detector_fft(order=order, ripple=ripple)
+        #self.pitch_detector_autocorr()
         
     def plot_filtered(self):
         fig, axs = plt.subplots(11, 1, sharex=True)
@@ -125,8 +126,18 @@ class Vocoder():
         for i, signal in enumerate(self.sampled_weights):
             axs[i].plot(t, signal)
         axs[i].set_xlabel('Time [s]')
-            
-    def filter_bank(self, data, lp=True, rectify=True, order=20, ripple=3):
+    
+    def apply_bandpass(self, order, ripple, band, data):
+        sos_bp = cheby2(order, ripple, 
+                            band, 
+                            'bandpass', 
+                            fs=self.rate, 
+                            output='sos')
+        filtered = sosfilt(sos_bp, data)
+        return filtered
+    
+    def filter_bank(self, data, lp=True, rectify=True, 
+                    order=20, ripple=1):
         # Calculate normalization factor
         if rectify:
             norm_factor = 0.5 / (len(self.filter_edges) - 1)
@@ -135,18 +146,14 @@ class Vocoder():
         values = np.zeros(((len(self.filter_edges) - 1), len(data)))
         
         # Low pass filter of 25 Hz
-        sos_lp = cheby1(order, ripple, 25, 'lp', fs=self.rate, output='sos')
+        sos_lp = cheby2(order, ripple, 25, 'lp', fs=self.rate, output='sos')
         for i, band in enumerate(self.filter_edges[:-2]):
             print(f"Filtering from {band} to {self.filter_edges[i +1]}")
             
             # First apply bandpass
-            sos_bp = cheby1(order, ripple, 
-                            [band, self.filter_edges[i +1]], 
-                            'bandpass', 
-                            fs=self.rate, 
-                            output='sos')
-            filtered = sosfilt(sos_bp, data)
-            
+            filtered = self.apply_bandpass(order, ripple, 
+                                           [band, self.filter_edges[i +1]],
+                                           data)
             # Rectify
             if rectify:
                 filtered[filtered < 0] = 0
@@ -160,13 +167,34 @@ class Vocoder():
             values[i, :] = filtered
         return values
     
-    def pitch_detector_autocorr(self, lp=False, order=20):
+    def pitch_detector_fft(self, lp=False, order=5,ripple=1):
+        unvoiced_thresh = 1e-5
+        # First of all filter signal to interested band
+        sos_bp = cheby2(order, ripple, [10, 2950], 'bandpass', fs=self.rate, output='sos')
+        data_mod = sosfilt(sos_bp, self.data)
+        
+        f, t, Sxx = spectrogram(data_mod, fs=self.rate,
+                                nperseg=1024, noverlap=142, nfft=4096)
+        vals = np.max(Sxx, axis=0)
+        idx = np.argmax(Sxx, axis=0)
+        idx[vals < unvoiced_thresh] = 0  # Set unvoiced to 0
+        freqs = f[idx]
+        freqs = np.repeat(freqs, np.ceil(len(self.data) / len(t)))[:len(self.data)]
+        print(f"Time resolution: {t[1] - t[0]} s")
+        print(f"Frequency resolution: {f[1] - f[0]} Hz")
+        print(f"Len {len(freqs)}")
+        
+        #plt.pcolormesh(t, f, Sxx)
+        #plt.plot(freqs)
+        self.pitches = freqs
+        
+    def pitch_detector_autocorr(self, lp=False, order=20, ripple=1):
         win_size = 500
         unvoiced_thresh = 1
         freqs = np.array([])
         
         # First of all filter signal to interested band
-        sos_bp = cheby1(order, 3, [10, 2950], 'bandpass', fs=self.rate, output='sos')
+        sos_bp = cheby2(order, ripple, [10, 2950], 'bandpass', fs=self.rate, output='sos')
         data_mod = sosfilt(sos_bp, self.data)
         
         for i in range(0, len(data_mod) - win_size, win_size):
@@ -185,8 +213,8 @@ class Vocoder():
                 # samples, and other peaks appearing higher.
                 # Should use a weighting function to de-emphasize the peaks at longer lags.
                 peak = np.argmax(corr[start:]) + start
-                px, py = parabolic(corr, peak)
-                
+                #px, py = parabolic(corr, peak)
+                px = corr[peak]
                 snap = [self.rate / px] * win_size
                 freqs = np.append(freqs, snap)
             else:
@@ -194,7 +222,7 @@ class Vocoder():
         
         # Apply 25 Hz LP filter
         if lp:
-            sos_lp = cheby1(order, 3, 25, 'lp', fs=self.rate, output='sos')
+            sos_lp = cheby2(order, ripple, 25, 'lp', fs=self.rate, output='sos')
             freqs = sosfilt(sos_lp, freqs)
         
         self.pitches = freqs
@@ -224,9 +252,9 @@ class Vocoder():
         self.f_quant = self.__quantize(self.sampled_pitches, freq_values)
         self.w_quant = self.__quantize(self.sampled_weights, w_values)
         
-    def synthesize(self, use_quant=True):
+    def synthesize(self, use_quant=True, final_bp=True,order=5, ripple=1):
         synth_fs = 44100
-        n_harms = 8
+        n_harms = 10
         sample_duration = 20e-3
         t = np.arange(0, sample_duration, 1 / synth_fs)
         signal = []
@@ -255,27 +283,40 @@ class Vocoder():
         signal = np.array(signal)
         
         # Apply weights
-        filtered_sines = self.filter_bank(signal, lp=False, rectify=False)
-        signal = np.zeros(filtered_sines.shape[1])
+        filtered_sines = self.filter_bank(signal, lp=False, rectify=False,
+                                          order=order, ripple=ripple)
+        signal = np.zeros((weights.shape[0], filtered_sines.shape[1]))
         
         for c in range(weights.shape[0]):
             weighted = np.repeat(weights[c, :], 
                                 int(filtered_sines.shape[1] / weights.shape[1]))
-            signal += weighted * filtered_sines[c, :] / weights.shape[0]
-        
+            signal_unfiltered = weighted * filtered_sines[c, :] / weights.shape[0]
+            # Apply BP once more
+            if final_bp:
+                signal[c, :] = self.apply_bandpass(order, ripple,
+                                                   [self.filter_edges[c],self.filter_edges[c + 1]],
+                                                   signal_unfiltered)
+            else:
+                signal[c, :] = signal_unfiltered
+        # Add all values
+        signal = np.sum(signal, axis=0)
         self.ad.frames = signal
         
 if __name__ == '__main__':
     rec_time = 5
+    order=25
+    ripple=20
     a = AudioDevice()
     a.load_wav("audio.wav")
+    #a.play()
     print(f"Record for {rec_time} seconds...")
     #a.record(rec_time)
-    #a.save_wav()
-    v = Vocoder(a)
+    #a.save_wav("english.wav")
+    v = Vocoder(a,order=order, ripple=ripple)
+    v.plot_filtered()
     v.sample()
     v.get_quantized()
-    v.synthesize(use_quant=False)
+    v.synthesize(use_quant=True, order=order, ripple=ripple)
     v.ad.play()
     #v.plot_filtered_sampled()
     #a.record(rec_time)
