@@ -14,6 +14,23 @@ import matplotlib.pyplot as plt
 from scipy.io import wavfile
 from scipy.signal import sosfilt, cheby1, correlate
 
+def parabolic(f, x):
+    """Quadratic interpolation for estimating the true position of an
+    inter-sample maximum when nearby samples are known.
+    f is a vector and x is an index for that vector.
+    Returns (vx, vy), the coordinates of the vertex of a parabola that goes
+    through point x and its two neighbors.
+    Example:
+    Defining a vector f with a local maximum at index 3 (= 6), find local
+    maximum if points 2, 3, and 4 actually defined a parabola.
+    In [3]: f = [2, 3, 1, 6, 4, 2, 3, 1]
+    In [4]: parabolic(f, argmax(f))
+    Out[4]: (3.2142857142857144, 6.1607142857142856)
+    """
+    xv = 1/2. * (f[x-1] - f[x+1]) / (f[x-1] - 2 * f[x] + f[x+1]) + x
+    yv = f[x] - 1/4. * (f[x-1] - f[x+1]) * (xv - x)
+    return (xv, yv)
+
 def butter_bandpass(lowcut, highcut, fs, order=5):
     nyq = 0.5 * fs
     low = lowcut / nyq
@@ -92,27 +109,8 @@ class Vocoder():
         self.ad = audio_device
         self.data = self.ad.frames
         self.rate = self.ad.rate
-        self.filter_bank()
-        self.pitch_detector_autocorr()
         
-    def plot_filtered(self):
-        fig, axs = plt.subplots(11, 1, sharex=True)
-        t = np.arange(0, len(self.data) / self.rate, 1/ self.rate)
-        axs[0].plot(t, self.data)
-        for i, signal in enumerate(self.filtered):
-            axs[i + 1].plot(t, signal)
-        axs[i + 1].set_xlabel('Time [s]')
-    
-    def plot_filtered_sampled(self):
-        fig, axs = plt.subplots(11, 1, sharex=True)
-        t = np.arange(0, self.sampled_weights.shape[1] * 20e-3, 20e-3)
-        for i, signal in enumerate(self.sampled_weights):
-            axs[i].plot(t, signal)
-        axs[i].set_xlabel('Time [s]')
-            
-    def filter_bank(self):
-        values = np.zeros((10, len(self.data)))
-        filter_bank = [[150, 350],
+        self.filter_channels = [[150, 350],
                        [350, 550],
                        [550, 750],
                        [750, 1050],
@@ -123,27 +121,62 @@ class Vocoder():
                        [2350, 2650],
                        [2650, 2950]]
         
+        self.weights = self.filter_bank(self.data)
+        self.pitch_detector_autocorr()
+        
+    def plot_filtered(self):
+        fig, axs = plt.subplots(11, 1, sharex=True)
+        t = np.arange(0, len(self.data) / self.rate, 1/ self.rate)
+        axs[0].plot(t, self.data)
+        for i, signal in enumerate(self.weights):
+            axs[i + 1].plot(t, signal)
+        axs[i + 1].set_xlabel('Time [s]')
+    
+    def plot_filtered_sampled(self):
+        fig, axs = plt.subplots(11, 1, sharex=True)
+        t = np.arange(0, self.sampled_weights.shape[1] * 20e-3, 20e-3)
+        for i, signal in enumerate(self.sampled_weights):
+            axs[i].plot(t, signal)
+        axs[i].set_xlabel('Time [s]')
+            
+    def filter_bank(self, data, lp=True, rectify=True, order=20):
+        # Calculate normalization factor
+        if rectify:
+            norm_factor = 0.5 / len(self.filter_channels)
+        else:
+            norm_factor = 1 / len(self.filter_channels)
+        values = np.zeros((len(self.filter_channels), len(data)))
+        
         # Low pass filter of 25 Hz
-        sos_lp = cheby1(10, 1, 25, 'lp', fs=self.rate, output='sos')
-        for i, band in enumerate(filter_bank):
+        sos_lp = cheby1(order, 1, 25, 'lp', fs=self.rate, output='sos')
+        for i, band in enumerate(self.filter_channels):
             print(f"Filtering from {band[0]} to {band[1]}")
+            
             # First apply bandpass
-            sos_bp = cheby1(10, 1, band, 'bandpass', fs=self.rate, output='sos')
-            filtered = sosfilt(sos_bp, self.data)
+            sos_bp = cheby1(order, 1, 
+                            band, 
+                            'bandpass', 
+                            fs=self.rate, 
+                            output='sos')
+            filtered = sosfilt(sos_bp, data)
             
             # Rectify
-            filtered[filtered < 0] = 0
+            if rectify:
+                filtered[filtered < 0] = 0
             
             # Apply 25 Hz lowpass filter
-            filtered = sosfilt(sos_lp, filtered)
+            if lp:
+                filtered = sosfilt(sos_lp, filtered)
+            
+            # Normalize to 1
+            filtered = filtered / norm_factor
             values[i, :] = filtered
-        self.weights = values
+        return values
     
-    def pitch_detector_autocorr(self):
-        win_size = 400
-        self.pitch_rate = self.rate / win_size
-        print(f"Pitch detection frequency: {self.pitch_rate} Hz")
-        freqs = []
+    def pitch_detector_autocorr(self, lp=False):
+        win_size = 500
+        unvoiced_thresh = 1
+        freqs = np.array([])
         
         # First of all filter signal to interested band
         sos_bp = cheby1(10, 1, [150, 2950], 'bandpass', fs=self.rate, output='sos')
@@ -155,23 +188,30 @@ class Vocoder():
             corr = correlate(sig, sig, mode='full')
             corr = corr[len(corr)//2:]
             
-            # Find the first low point
-            d = np.diff(corr)
-            start = np.nonzero(d > 0)[0][0]
-            # Find the next peak after the low point (other than 0 lag).  This bit is
-            # not reliable for long signals, due to the desired peak occurring between
-            # samples, and other peaks appearing higher.
-            # Should use a weighting function to de-emphasize the peaks at longer lags.
-            peak = np.argmax(corr[start:]) + start
-            px = corr[peak]
-
-            freqs.append(self.rate / px)
+            # Check if correlation result is voiced
+            if max(corr) > unvoiced_thresh:
+                # Find the first low point
+                d = np.diff(corr)
+                start = np.nonzero(d > 0)[0][0]
+                # Find the next peak after the low point (other than 0 lag).  This bit is
+                # not reliable for long signals, due to the desired peak occurring between
+                # samples, and other peaks appearing higher.
+                # Should use a weighting function to de-emphasize the peaks at longer lags.
+                peak = np.argmax(corr[start:]) + start
+                px, py = parabolic(corr, peak)
+                
+                snap = [self.rate / px] * win_size
+                freqs = np.append(freqs, snap)
+            else:
+                freqs = np.append(freqs, np.zeros(win_size))
         
         # Apply 25 Hz LP filter
-        sos_lp = cheby1(10, 1, 25, 'lp', fs=self.pitch_rate, output='sos')
-        freqs_lp = sosfilt(sos_lp, np.array(freqs))
-        self.pitches = freqs_lp
-    
+        if lp:
+            sos_lp = cheby1(20, 1, 25, 'lp', fs=self.rate, output='sos')
+            freqs = sosfilt(sos_lp, freqs)
+        
+        self.pitches = freqs
+
     def sample(self):
         rate_s = 20e-3  # One sample every 20ms
         
@@ -179,12 +219,41 @@ class Vocoder():
         self.sampled_weights = self.weights[:, 0::int(self.rate * rate_s)]
         
         # Then sample the frequencies
-        self.sampled_pitches = self.pitches[0::int(self.pitch_rate * rate_s)]
-        #self.sampled_pitches = self.sampled_pitches[]
+        self.sampled_pitches = self.pitches[0::int(self.rate * rate_s)]
         
         print(len(self.sampled_pitches))
+        
     def synthesize(self):
-        pass
+        synth_fs = 44100
+        n_harms = 8
+        sample_duration = 20e-3
+        t = np.arange(0, 20e-3, 1 / synth_fs)
+        signal = []
+        for i in range(len(self.sampled_pitches)):
+            
+            # Check if voiced
+            if self.sampled_pitches[i] != 0:
+                # Generate the harmonics for voiced
+                sines = np.zeros(len(t))
+                for h in range(n_harms):
+                    sines += np.sin(2*np.pi*t * self.sampled_pitches[i] * (h + 1)) / n_harms
+                
+                signal.extend(sines)    
+            else:
+                # Generate Gauss noise for unvoiced
+                noise = np.random.normal(size=len(t))
+                signal.extend(noise)
+        signal = np.array(signal)
+        
+        # Apply weights
+        filtered_sines = self.filter_bank(signal, lp=False, rectify=False)
+        signal = np.zeros(filtered_sines.shape[1])
+        for c in range(self.sampled_weights.shape[0]):
+            weights = np.repeat(self.sampled_weights[c, :], 
+                                int(filtered_sines.shape[1] / self.sampled_weights.shape[1]))
+            signal += weights * filtered_sines[c, :] / self.sampled_weights.shape[0]
+        
+        self.ad.frames = signal
         
 if __name__ == '__main__':
     rec_time = 5
@@ -192,7 +261,9 @@ if __name__ == '__main__':
     a.load_wav()
     v = Vocoder(a)
     v.sample()
-    v.plot_filtered_sampled()
+    v.synthesize()
+    v.ad.play()
+    #v.plot_filtered_sampled()
     #a.record(rec_time)
     #a.show_timeplot()
     #time.sleep(rec_time)
