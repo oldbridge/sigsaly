@@ -100,10 +100,6 @@ class AudioDevice():
         # Play the sound by writing the audio data to the stream
         self.frames = data / 32768
     
-    def bandpass_signal(self):
-        self.frames = butter_bandpass_filter(self.frames, 
-                                             150, 2950, self.rate)
-    
 class Vocoder():
     def __init__(self, audio_device):
         self.ad = audio_device
@@ -286,7 +282,6 @@ if __name__ == '__main__':
     #a.show_timeplot()
     #time.sleep(rec_time)
     #a.show_timeplot()
-    #a.bandpass_signal()
     #a.play()
     #a.save_wav()
     
