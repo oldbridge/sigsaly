@@ -222,21 +222,43 @@ class Vocoder():
         self.sampled_pitches = self.pitches[0::int(self.rate * rate_s)]
         
         print(len(self.sampled_pitches))
+    
+    def __quantize(self, raw_data, bins):
+        quant = np.digitize(raw_data, bins)
+        quant[quant == 0] = 1
+        quant = quant - 1
+        quant = bins[quant]
+        return quant
+    
+    def get_quantized(self):
+        w_values = np.array([0.0, 0.05, 0.1, 0.4, 0.8, 1])  # 6 levels txori-logarithmic for weights
+        freq_values = np.linspace(150, 2950, 36)  # 36 levels lineal for pitches
         
-    def synthesize(self):
+        self.f_quant = self.__quantize(self.sampled_pitches, freq_values)
+        self.w_quant = self.__quantize(self.sampled_weights, w_values)
+        
+    def synthesize(self, use_quant=True):
         synth_fs = 44100
         n_harms = 8
         sample_duration = 20e-3
         t = np.arange(0, 20e-3, 1 / synth_fs)
         signal = []
-        for i in range(len(self.sampled_pitches)):
+        
+        if use_quant:
+            pitches = self.f_quant
+            weights = self.w_quant
+        else:
+            pitches = self.sampled_pitches
+            weights = self.sampled_weights
+        
+        for i in range(len(pitches)):
             
             # Check if voiced
-            if self.sampled_pitches[i] != 0:
+            if pitches[i] != 0:
                 # Generate the harmonics for voiced
                 sines = np.zeros(len(t))
                 for h in range(n_harms):
-                    sines += np.sin(2*np.pi*t * self.sampled_pitches[i] * (h + 1)) / n_harms
+                    sines += np.sin(2*np.pi*t * pitches[i] * (h + 1)) / n_harms
                 
                 signal.extend(sines)    
             else:
@@ -248,10 +270,10 @@ class Vocoder():
         # Apply weights
         filtered_sines = self.filter_bank(signal, lp=False, rectify=False)
         signal = np.zeros(filtered_sines.shape[1])
-        for c in range(self.sampled_weights.shape[0]):
-            weights = np.repeat(self.sampled_weights[c, :], 
-                                int(filtered_sines.shape[1] / self.sampled_weights.shape[1]))
-            signal += weights * filtered_sines[c, :] / self.sampled_weights.shape[0]
+        for c in range(weights.shape[0]):
+            weighted = np.repeat(weights[c, :], 
+                                int(filtered_sines.shape[1] / weights.shape[1]))
+            signal += weighted * filtered_sines[c, :] / weights.shape[0]
         
         self.ad.frames = signal
         
@@ -261,6 +283,7 @@ if __name__ == '__main__':
     a.load_wav()
     v = Vocoder(a)
     v.sample()
+    v.get_quantized()
     v.synthesize()
     v.ad.play()
     #v.plot_filtered_sampled()
